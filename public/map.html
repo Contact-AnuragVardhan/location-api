@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Live Locations (Leaflet + API)</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <style>
+      body { font-family: system-ui, Arial, sans-serif; margin: 16px; }
+      #map { height: 520px; width: 100%; border: 1px solid #ddd; border-radius: 8px; }
+      #controls { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; align-items: center; }
+      #controls input[type="text"] { width: 260px; padding: 6px; }
+      #controls button { padding: 8px 10px; cursor: pointer; }
+      .small { opacity: 0.7; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <h3>Live Location Viewer</h3>
+
+    <div id="controls">
+      <label>API Base:</label>
+      <input id="apiBase" type="text" value="http://localhost:3000" />
+      <button id="btnLatest">Load Latest</button>
+      <button id="btnAll">Load All</button>
+      <button id="btnTogglePoll">Start Auto-Refresh</button>
+      <span class="small">Open this page via http://localhost:8080. If viewing on your phone, replace with your PC IP (e.g. http://192.168.1.50:3000).</span>
+    </div>
+
+    <div id="map"></div>
+
+    <script>
+      const map = L.map("map").setView([20, 0], 2);
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        attribution: "© OpenStreetMap contributors",
+      }).addTo(map);
+
+      let latestMarker = null;
+      let pathLine = null;
+
+      function setLatestMarker(lat, lng) {
+        if (latestMarker) {
+          latestMarker.setLatLng([lat, lng]);
+        } else {
+          latestMarker = L.marker([lat, lng]).addTo(map);
+        }
+        latestMarker.bindPopup(`Lat: ${lat.toFixed(6)}<br>Lng: ${lng.toFixed(6)}`).openPopup();
+        map.setView([lat, lng], 14);
+      }
+
+      function drawPath(points) {
+        if (pathLine) map.removeLayer(pathLine);
+        if (points.length > 1) {
+          pathLine = L.polyline(points, { weight: 3 }).addTo(map);
+          map.fitBounds(pathLine.getBounds(), { padding: [30, 30] });
+        } else if (points.length === 1) {
+          setLatestMarker(points[0][0], points[0][1]);
+        }
+      }
+
+      async function fetchLatest(base) {
+        const res = await fetch(`${base}/locations/latest`);
+        if (res.status === 204) return null;
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      }
+
+      async function fetchAll(base) {
+        const res = await fetch(`${base}/locations`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      }
+
+      document.getElementById("btnLatest").onclick = async () => {
+        const base = document.getElementById("apiBase").value.trim();
+        try {
+          const loc = await fetchLatest(base);
+          if (!loc) return alert("No locations yet.");
+          setLatestMarker(loc.latitude, loc.longitude);
+        } catch (e) {
+          alert("Failed to load latest: " + e.message);
+        }
+      };
+
+      document.getElementById("btnAll").onclick = async () => {
+        const base = document.getElementById("apiBase").value.trim();
+        try {
+          const arr = await fetchAll(base);
+          if (!arr || arr.length === 0) return alert("No locations yet.");
+          const pts = arr.map(p => [p.latitude, p.longitude]);
+          drawPath(pts);
+          const last = pts[pts.length - 1];
+          setLatestMarker(last[0], last[1]);
+        } catch (e) {
+          alert("Failed to load all: " + e.message);
+        }
+      };
+
+      let pollTimer = null;
+      const btnToggle = document.getElementById("btnTogglePoll");
+      btnToggle.onclick = () => {
+        if (pollTimer) {
+          clearInterval(pollTimer);
+          pollTimer = null;
+          btnToggle.textContent = "Start Auto-Refresh";
+          return;
+        }
+        const base = document.getElementById("apiBase").value.trim();
+        const poll = async () => {
+          try {
+            const arr = await fetchAll(base);
+            if (arr && arr.length > 0) {
+              const pts = arr.map(p => [p.latitude, p.longitude]);
+              drawPath(pts);
+              const last = pts[pts.length - 1];
+              setLatestMarker(last[0], last[1]);
+            }
+          } catch {}
+        };
+        poll();
+        pollTimer = setInterval(poll, 5000);
+        btnToggle.textContent = "Stop Auto-Refresh";
+      };
+    </script>
+  </body>
+</html>
