@@ -2,9 +2,10 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>Live Locations (Leaflet + API)</title>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
-    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <title>Live Locations (MapLibre GL + Uber-style)</title>
+    <meta name="viewport" content="initial-scale=1,maximum-scale=1,user-scalable=no" />
+    <script src="https://unpkg.com/maplibre-gl@3.6.0/dist/maplibre-gl.js"></script>
+    <link href="https://unpkg.com/maplibre-gl@3.6.0/dist/maplibre-gl.css" rel="stylesheet" />
     <style>
       html, body {
         height: 100%;
@@ -12,22 +13,30 @@
         margin: 0;
         padding: 0;
       }
+      #map {
+        position: absolute;
+        top: 0; bottom: 0; width: 100%;
+      }
       #controls {
         position: absolute;
         top: 10px;
         left: 10px;
-        z-index: 1000;
+        z-index: 1;
         background: rgba(255, 255, 255, 0.9);
         padding: 8px;
         border-radius: 6px;
         font-size: 14px;
       }
-      #map {
-        height: 100%;
-        width: 100%;
+      .car-marker {
+        width: 40px;
+        height: 40px;
+        transform-origin: center;
+        transition: transform 0.3s linear;
       }
-      #controls input[type="text"] {
-        width: 220px;
+      .car-marker svg {
+        width: 100%;
+        height: 100%;
+        fill: #ff3333; /* car color */
       }
     </style>
   </head>
@@ -35,52 +44,138 @@
     <div id="controls">
       <label>API Base:</label>
       <input id="apiBase" type="text" value="https://location-api-cc1x.onrender.com" />
-      <button id="btnLatest">Load Latest</button>
-      <button id="btnAll">Load All</button>
       <button id="btnTogglePoll">Start Auto-Refresh</button>
     </div>
 
     <div id="map"></div>
 
     <script>
-      const map = L.map("map").setView([20, 0], 2);
-      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        attribution: "© OpenStreetMap contributors",
-      }).addTo(map);
+      // Initialize MapLibre with Carto Dark Matter (free street-level dark style)
+      const map = new maplibregl.Map({
+        container: "map",
+        style: "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
+        center: [77.5946, 12.9716], // example: Bangalore
+        zoom: 16,
+        pitch: 60,   // 👈 tilt for 3D effect
+        bearing: -30 // 👈 rotate like Uber nav
+      });
+
+      map.on("load", () => {
+        if (map.getStyle().layers.some(l => l.id === "building")) {
+          map.addLayer({
+            id: "3d-buildings",
+            source: "openmaptiles",
+            "source-layer": "building",
+            type: "fill-extrusion",
+            paint: {
+              "fill-extrusion-color": "#aaa",
+              "fill-extrusion-height": ["get", "render_height"],
+              "fill-extrusion-opacity": 0.6
+            }
+          });
+        }
+      });
 
       let latestMarker = null;
-      let pathLine = L.polyline([], { weight: 3 }).addTo(map);
-      let lastId = null; // track last seen id
-      let firstFit = false; // only auto-zoom the first time
+      let carEl = null;
+      let lastId = null;
+      let lastCoords = null;
+      let currentScale = 1;
+      const baseZoom = 14;
 
-      function updateTrack(newLocs) {
-        if (!newLocs.length) return;
+      function lerp(a, b, t) {
+        return a + (b - a) * t;
+      }
 
-        const last = newLocs[newLocs.length - 1];
-        if (lastId === last.id) {
-          // no change → skip update
-          return;
+      function getBearing(from, to) {
+        const [lng1, lat1] = from.map(x => x * Math.PI / 180);
+        const [lng2, lat2] = to.map(x => x * Math.PI / 180);
+        const dLng = lng2 - lng1;
+        const y = Math.sin(dLng) * Math.cos(lat2);
+        const x = Math.cos(lat1) * Math.sin(lat2) -
+                  Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+        const brng = Math.atan2(y, x) * 180 / Math.PI;
+        return (brng + 360) % 360;
+      }
+
+      function animateMarker(from, to, duration = 2000) {
+        const start = performance.now();
+        const bearing = getBearing(from, to);
+
+        function step(now) {
+          const t = Math.min((now - start) / duration, 1);
+          const lng = lerp(from[0], to[0], t);
+          const lat = lerp(from[1], to[1], t);
+
+          if (latestMarker) {
+            latestMarker.setLngLat([lng, lat]);
+            carEl.style.transform = `rotate(${bearing}deg) scale(${currentScale})`;
+          }
+
+          // Smoothly follow the car while keeping tilt & bearing
+          map.easeTo({
+            center: [lng, lat],
+            zoom: map.getZoom(),
+            pitch: map.getPitch(),
+            bearing: map.getBearing(),
+            duration: 100
+          });
+
+          if (t < 1) {
+            requestAnimationFrame(step);
+          } else {
+            lastCoords = to;
+          }
         }
+        requestAnimationFrame(step);
+      }
+
+      function updateTrack(points) {
+        if (!points.length) return;
+
+        const last = points[points.length - 1];
+        if (lastId === last.id) return;
         lastId = last.id;
 
-        // update path with all points
-        const pts = newLocs.map(p => [p.latitude, p.longitude]);
-        pathLine.setLatLngs(pts);
-
-        // update marker
-        if (latestMarker) {
-          latestMarker.setLatLng([last.latitude, last.longitude]);
+        if (!latestMarker) {
+          carEl = document.createElement("div");
+          carEl.className = "car-marker";
+          carEl.innerHTML = `
+            <svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg">
+              <path d="M256 32c-27.6 0-52 17-61.5 42.1L128 256v160c0 17.7 14.3 32 32 
+              32h32c17.7 0 32-14.3 32-32V384h64v32c0 17.7 14.3 32 32 
+              32h32c17.7 0 32-14.3 32-32V256l-66.5-181.9C308 49 283.6 32 256 32z"/>
+            </svg>`;
+          latestMarker = new maplibregl.Marker({ element: carEl, rotationAlignment: "map" })
+            .setLngLat([last.longitude, last.latitude])
+            .addTo(map);
+          lastCoords = [last.longitude, last.latitude];
         } else {
-          latestMarker = L.marker([last.latitude, last.longitude]).addTo(map);
+          animateMarker(lastCoords, [last.longitude, last.latitude]);
         }
-        latestMarker.bindPopup(
-          `Lat: ${last.latitude.toFixed(6)}<br>Lng: ${last.longitude.toFixed(6)}`
-        );
 
-        // only fit bounds once (initial load), then keep map position
-        if (!firstFit) {
-          map.fitBounds(pathLine.getBounds(), { padding: [30, 30] });
-          firstFit = true;
+        // path (line)
+        const coords = points.map(p => [p.longitude, p.latitude]);
+        if (map.getSource("route")) {
+          map.getSource("route").setData({
+            type: "Feature",
+            geometry: { type: "LineString", coordinates: coords }
+          });
+        } else {
+          map.addSource("route", {
+            type: "geojson",
+            data: {
+              type: "Feature",
+              geometry: { type: "LineString", coordinates: coords }
+            }
+          });
+          map.addLayer({
+            id: "route",
+            type: "line",
+            source: "route",
+            layout: { "line-join": "round", "line-cap": "round" },
+            paint: { "line-color": "#00ccff", "line-width": 4 }
+          });
         }
       }
 
@@ -90,26 +185,17 @@
         return res.json();
       }
 
-      document.getElementById("btnLatest").onclick = async () => {
-        const base = document.getElementById("apiBase").value.trim();
-        try {
-          const arr = await fetchAll(base);
-          updateTrack(arr);
-        } catch (e) {
-          alert("Failed: " + e.message);
+      // zoom scaling
+      map.on("zoom", () => {
+        const z = map.getZoom();
+        currentScale = Math.max(0.3, z / baseZoom);
+        if (carEl) {
+          const rotate = carEl.style.transform.match(/rotate\([^)]*\)/)?.[0] || "rotate(0deg)";
+          carEl.style.transform = `${rotate} scale(${currentScale})`;
         }
-      };
+      });
 
-      document.getElementById("btnAll").onclick = async () => {
-        const base = document.getElementById("apiBase").value.trim();
-        try {
-          const arr = await fetchAll(base);
-          updateTrack(arr);
-        } catch (e) {
-          alert("Failed: " + e.message);
-        }
-      };
-
+      // polling
       let pollTimer = null;
       const btnToggle = document.getElementById("btnTogglePoll");
       btnToggle.onclick = () => {
@@ -124,9 +210,11 @@
           try {
             const arr = await fetchAll(base);
             updateTrack(arr);
-          } catch {}
+          } catch (e) {
+            console.log("Poll error:", e.message);
+          }
         };
-        poll(); // run immediately
+        poll();
         pollTimer = setInterval(poll, 5000);
         btnToggle.textContent = "Stop Auto-Refresh";
       };
